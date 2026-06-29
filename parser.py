@@ -238,6 +238,31 @@ async def parse_catalogue(session: aiohttp.ClientSession) -> dict[str, int]:
     return mapping
 
 
+SEMAPHORE = asyncio.Semaphore(5)  # max 5 параллельных запросов
+
+
+async def parse_and_save(session, pid, topic_id, sub_code):
+    async with SEMAPHORE:
+        await asyncio.sleep(0.5)
+        problem = await parse_problem_page(session, pid)
+        if not problem or len(problem["text"]) < 20:
+            return 0
+        q_id = await db.upsert_question(
+            external_id=problem["external_id"],
+            topic_id=topic_id,
+            text=problem["text"],
+            image_url=problem["image_url"],
+            answer=problem["answer"],
+            explanation=problem["explanation"],
+            question_type=problem["question_type"],
+            task_number=problem["task_number"],
+        )
+        if problem["choices"]:
+            await db.insert_choices(q_id, problem["choices"])
+        log.info("  [%s] Сохранён вопрос #%s", sub_code, pid)
+        return 1
+
+
 async def run_parser(max_per_topic: int = 50):
     await db.init_db()
 
@@ -251,53 +276,28 @@ async def run_parser(max_per_topic: int = 50):
                 topic_id = await db.upsert_topic(sub_code, sub_title, parent_id=section_id)
                 log.info("Тема %s — %s", sub_code, sub_title)
 
-                # Search problems by topic keyword
-                collected = 0
+                all_pids = []
                 for page in range(1, 6):
-                    if collected >= max_per_topic:
-                        break
-
-                    # Use catalogue search by keyword
                     search_url = f"{BASE_URL}/search?search={sub_title[:30]}&page={page}"
                     html = await fetch(session, search_url)
                     if not html:
                         break
-
                     soup = BeautifulSoup(html, "lxml")
-                    problem_links = soup.find_all("a", href=re.compile(r"/problem\?id=\d+"))
-                    if not problem_links:
+                    links = soup.find_all("a", href=re.compile(r"/problem\?id=\d+"))
+                    if not links:
                         break
-
-                    for a in problem_links:
-                        if collected >= max_per_topic:
-                            break
+                    for a in links:
                         m = re.search(r"id=(\d+)", a["href"])
-                        if not m:
-                            continue
-                        pid = m.group(1)
+                        if m:
+                            all_pids.append(m.group(1))
+                    await asyncio.sleep(0.3)
 
-                        await asyncio.sleep(PARSE_DELAY)
-                        problem = await parse_problem_page(session, pid)
-                        if not problem or len(problem["text"]) < 20:
-                            continue
+                all_pids = list(dict.fromkeys(all_pids))[:max_per_topic]
 
-                        q_id = await db.upsert_question(
-                            external_id=problem["external_id"],
-                            topic_id=topic_id,
-                            text=problem["text"],
-                            image_url=problem["image_url"],
-                            answer=problem["answer"],
-                            explanation=problem["explanation"],
-                            question_type=problem["question_type"],
-                            task_number=problem["task_number"],
-                        )
-                        if problem["choices"]:
-                            await db.insert_choices(q_id, problem["choices"])
-
-                        collected += 1
-                        log.info("  [%s] Сохранён вопрос #%s (%d)", sub_code, pid, collected)
-
-                    await asyncio.sleep(PARSE_DELAY)
+                # Парсим все вопросы темы параллельно
+                tasks = [parse_and_save(session, pid, topic_id, sub_code) for pid in all_pids]
+                results = await asyncio.gather(*tasks)
+                log.info("  [%s] Сохранено %d вопросов", sub_code, sum(results))
 
         log.info("Парсинг завершён.")
 
