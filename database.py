@@ -1,19 +1,29 @@
-import aiosqlite
-from config import DB_PATH
+import asyncpg
+from config import DATABASE_URL
+
+_pool: asyncpg.Pool = None
+
+
+async def get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    return _pool
 
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript("""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS topics (
-                id INTEGER PRIMARY KEY,
+                id SERIAL PRIMARY KEY,
                 code TEXT NOT NULL,
                 title TEXT NOT NULL,
                 parent_id INTEGER REFERENCES topics(id)
             );
 
             CREATE TABLE IF NOT EXISTS questions (
-                id INTEGER PRIMARY KEY,
+                id SERIAL PRIMARY KEY,
                 external_id TEXT UNIQUE,
                 topic_id INTEGER REFERENCES topics(id),
                 text TEXT NOT NULL,
@@ -24,16 +34,17 @@ async def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS choices (
-                id INTEGER PRIMARY KEY,
+                id SERIAL PRIMARY KEY,
                 question_id INTEGER REFERENCES questions(id),
                 letter TEXT NOT NULL,
-                text TEXT NOT NULL
+                text TEXT NOT NULL,
+                UNIQUE(question_id, letter)
             );
 
             CREATE TABLE IF NOT EXISTS user_progress (
-                user_id INTEGER NOT NULL,
+                user_id BIGINT NOT NULL,
                 question_id INTEGER REFERENCES questions(id),
-                answered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                answered_at TIMESTAMP DEFAULT NOW(),
                 is_correct INTEGER DEFAULT 0,
                 PRIMARY KEY (user_id, question_id)
             );
@@ -41,134 +52,116 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_questions_topic ON questions(topic_id);
             CREATE INDEX IF NOT EXISTS idx_progress_user ON user_progress(user_id);
         """)
-        await db.commit()
 
 
 async def get_topics(parent_id=None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         if parent_id is None:
-            async with db.execute(
+            return await conn.fetch(
                 "SELECT * FROM topics WHERE parent_id IS NULL ORDER BY code"
-            ) as cur:
-                return await cur.fetchall()
-        else:
-            async with db.execute(
-                "SELECT * FROM topics WHERE parent_id=? ORDER BY code", (parent_id,)
-            ) as cur:
-                return await cur.fetchall()
+            )
+        return await conn.fetch(
+            "SELECT * FROM topics WHERE parent_id=$1 ORDER BY code", parent_id
+        )
 
 
 async def get_topic(topic_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM topics WHERE id=?", (topic_id,)) as cur:
-            return await cur.fetchone()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM topics WHERE id=$1", topic_id)
 
 
 async def get_questions(topic_id, limit=1, offset=0, exclude_ids=None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        exclude_clause = ""
-        params = [topic_id]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         if exclude_ids:
-            placeholders = ",".join("?" * len(exclude_ids))
-            exclude_clause = f"AND id NOT IN ({placeholders})"
-            params.extend(exclude_ids)
-        params.extend([limit, offset])
-        async with db.execute(
-            f"SELECT * FROM questions WHERE topic_id=? {exclude_clause} ORDER BY RANDOM() LIMIT ? OFFSET ?",
-            params,
-        ) as cur:
-            return await cur.fetchall()
+            return await conn.fetch(
+                "SELECT * FROM questions WHERE topic_id=$1 AND id != ALL($2) ORDER BY RANDOM() LIMIT $3 OFFSET $4",
+                topic_id, exclude_ids, limit, offset,
+            )
+        return await conn.fetch(
+            "SELECT * FROM questions WHERE topic_id=$1 ORDER BY RANDOM() LIMIT $2 OFFSET $3",
+            topic_id, limit, offset,
+        )
 
 
 async def get_question(question_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM questions WHERE id=?", (question_id,)) as cur:
-            return await cur.fetchone()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM questions WHERE id=$1", question_id)
 
 
 async def get_choices(question_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM choices WHERE question_id=? ORDER BY letter", (question_id,)
-        ) as cur:
-            return await cur.fetchall()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            "SELECT * FROM choices WHERE question_id=$1 ORDER BY letter", question_id
+        )
 
 
 async def count_questions(topic_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM questions WHERE topic_id=?", (topic_id,)
-        ) as cur:
-            row = await cur.fetchone()
-            return row[0]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM questions WHERE topic_id=$1", topic_id
+        )
 
 
 async def save_progress(user_id, question_id, is_correct):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
             """INSERT INTO user_progress (user_id, question_id, is_correct)
-               VALUES (?, ?, ?)
-               ON CONFLICT(user_id, question_id) DO UPDATE SET
-               is_correct=excluded.is_correct, answered_at=CURRENT_TIMESTAMP""",
-            (user_id, question_id, int(is_correct)),
+               VALUES ($1, $2, $3)
+               ON CONFLICT (user_id, question_id) DO UPDATE
+               SET is_correct=EXCLUDED.is_correct, answered_at=NOW()""",
+            user_id, question_id, int(is_correct),
         )
-        await db.commit()
 
 
 async def get_user_stats(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT COUNT(*), SUM(is_correct) FROM user_progress WHERE user_id=?",
-            (user_id,),
-        ) as cur:
-            row = await cur.fetchone()
-            total = row[0] or 0
-            correct = row[1] or 0
-            return total, correct
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*), SUM(is_correct) FROM user_progress WHERE user_id=$1", user_id
+        )
+        total = row[0] or 0
+        correct = row[1] or 0
+        return total, correct
 
 
 async def upsert_topic(code, title, parent_id=None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id FROM topics WHERE code=?", (code,)
-        ) as cur:
-            row = await cur.fetchone()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id FROM topics WHERE code=$1", code)
         if row:
-            return row[0]
-        async with db.execute(
-            "INSERT INTO topics (code, title, parent_id) VALUES (?,?,?)",
-            (code, title, parent_id),
-        ) as cur:
-            await db.commit()
-            return cur.lastrowid
+            return row["id"]
+        return await conn.fetchval(
+            "INSERT INTO topics (code, title, parent_id) VALUES ($1,$2,$3) RETURNING id",
+            code, title, parent_id,
+        )
 
 
 async def upsert_question(external_id, topic_id, text, image_url, answer, explanation, question_type):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id FROM questions WHERE external_id=?", (external_id,)
-        ) as cur:
-            row = await cur.fetchone()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM questions WHERE external_id=$1", external_id
+        )
         if row:
-            return row[0]
-        async with db.execute(
+            return row["id"]
+        return await conn.fetchval(
             """INSERT INTO questions (external_id, topic_id, text, image_url, answer, explanation, question_type)
-               VALUES (?,?,?,?,?,?,?)""",
-            (external_id, topic_id, text, image_url, answer, explanation, question_type),
-        ) as cur:
-            await db.commit()
-            return cur.lastrowid
+               VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id""",
+            external_id, topic_id, text, image_url, answer, explanation, question_type,
+        )
 
 
 async def insert_choices(question_id, choices: list[tuple]):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executemany(
-            "INSERT OR IGNORE INTO choices (question_id, letter, text) VALUES (?,?,?)",
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            "INSERT INTO choices (question_id, letter, text) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
             [(question_id, letter, text) for letter, text in choices],
         )
-        await db.commit()
