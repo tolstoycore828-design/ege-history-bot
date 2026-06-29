@@ -7,6 +7,7 @@ router = Router()
 
 BACK_ROOT = InlineKeyboardButton(text="⬅️ К разделам", callback_data="topics:root")
 BACK_MAIN = InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")
+BACK_TASKS = InlineKeyboardButton(text="⬅️ К заданиям", callback_data="tasks:root")
 
 
 @router.callback_query(F.data == "main_menu")
@@ -19,7 +20,7 @@ async def cb_main_menu(cb: CallbackQuery):
 async def cb_topics_root(cb: CallbackQuery):
     sections = await db.get_topics(parent_id=None)
     if not sections:
-        await cb.answer("База вопросов ещё не загружена. Запустите parser.py", show_alert=True)
+        await cb.answer("База вопросов ещё не загружена.", show_alert=True)
         return
 
     rows = []
@@ -64,6 +65,35 @@ async def cb_section(cb: CallbackQuery):
     )
 
 
+@router.callback_query(F.data == "tasks:root")
+async def cb_tasks_root(cb: CallbackQuery):
+    task_numbers = await db.get_task_numbers()
+    if not task_numbers:
+        await cb.answer("Номера заданий ещё не загружены.", show_alert=True)
+        return
+
+    rows = []
+    row = []
+    for num in task_numbers:
+        count = await db.count_questions_by_task(num)
+        row.append(InlineKeyboardButton(
+            text=f"Задание {num} ({count})",
+            callback_data=f"task_quiz:{num}",
+        ))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([BACK_MAIN])
+
+    await cb.message.edit_text(
+        "📝 <b>Фильтр по номеру задания ЕГЭ</b>\n\nВыбери задание:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
 @router.callback_query(F.data == "stats")
 async def cb_stats(cb: CallbackQuery):
     total, correct = await db.get_user_stats(cb.from_user.id)
@@ -75,7 +105,8 @@ async def cb_stats(cb: CallbackQuery):
         f"Процент верных: <b>{pct}%</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📚 К темам", callback_data="topics:root")],
+            [InlineKeyboardButton(text="📚 По темам", callback_data="topics:root")],
+            [InlineKeyboardButton(text="📝 По заданиям", callback_data="tasks:root")],
             [BACK_MAIN],
         ]),
     )

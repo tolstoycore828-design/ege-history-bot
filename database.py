@@ -30,7 +30,8 @@ async def init_db():
                 image_url TEXT,
                 answer TEXT,
                 explanation TEXT,
-                question_type TEXT DEFAULT 'open'
+                question_type TEXT DEFAULT 'open',
+                task_number INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS choices (
@@ -151,7 +152,7 @@ async def upsert_topic(code, title, parent_id=None):
         )
 
 
-async def upsert_question(external_id, topic_id, text, image_url, answer, explanation, question_type):
+async def upsert_question(external_id, topic_id, text, image_url, answer, explanation, question_type, task_number=None):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -160,9 +161,51 @@ async def upsert_question(external_id, topic_id, text, image_url, answer, explan
         if row:
             return row["id"]
         return await conn.fetchval(
-            """INSERT INTO questions (external_id, topic_id, text, image_url, answer, explanation, question_type)
-               VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id""",
-            external_id, topic_id, text, image_url, answer, explanation, question_type,
+            """INSERT INTO questions (external_id, topic_id, text, image_url, answer, explanation, question_type, task_number)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id""",
+            external_id, topic_id, text, image_url, answer, explanation, question_type, task_number,
+        )
+
+
+async def get_task_numbers() -> list[int]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT DISTINCT task_number FROM questions q
+               WHERE task_number IS NOT NULL
+               AND EXISTS (SELECT 1 FROM choices WHERE question_id=q.id)
+               ORDER BY task_number"""
+        )
+        return [r["task_number"] for r in rows]
+
+
+async def get_questions_by_task(task_number, limit=1, exclude_ids=None):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if exclude_ids:
+            return await conn.fetch(
+                """SELECT q.* FROM questions q
+                   WHERE q.task_number=$1 AND q.id != ALL($2)
+                   AND EXISTS (SELECT 1 FROM choices WHERE question_id=q.id)
+                   ORDER BY RANDOM() LIMIT $3""",
+                task_number, exclude_ids, limit,
+            )
+        return await conn.fetch(
+            """SELECT q.* FROM questions q
+               WHERE q.task_number=$1
+               AND EXISTS (SELECT 1 FROM choices WHERE question_id=q.id)
+               ORDER BY RANDOM() LIMIT $2""",
+            task_number, limit,
+        )
+
+
+async def count_questions_by_task(task_number) -> int:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            """SELECT COUNT(*) FROM questions q WHERE q.task_number=$1
+               AND EXISTS (SELECT 1 FROM choices WHERE question_id=q.id)""",
+            task_number,
         )
 
 

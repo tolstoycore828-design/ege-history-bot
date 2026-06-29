@@ -177,6 +177,21 @@ async def parse_problem_page(session: aiohttp.ClientSession, problem_id: str) ->
         if choice_text:
             choices.append((letter, choice_text))
 
+    # Task number (номер задания ЕГЭ)
+    task_number = None
+    topic_tag = soup.find("span", class_="prob_nums")
+    if topic_tag:
+        m = re.search(r"Задание\s*(\d+)", topic_tag.get_text())
+        if m:
+            task_number = int(m.group(1))
+    if task_number is None:
+        # try from breadcrumb or header
+        for tag in soup.find_all(text=re.compile(r"Задание\s*\d+")):
+            m = re.search(r"Задание\s*(\d+)", tag)
+            if m:
+                task_number = int(m.group(1))
+                break
+
     q_type = "choice" if choices else "open"
 
     return {
@@ -187,6 +202,7 @@ async def parse_problem_page(session: aiohttp.ClientSession, problem_id: str) ->
         "explanation": explanation,
         "question_type": q_type,
         "choices": choices,
+        "task_number": task_number,
     }
 
 
@@ -273,6 +289,7 @@ async def run_parser(max_per_topic: int = 50):
                             answer=problem["answer"],
                             explanation=problem["explanation"],
                             question_type=problem["question_type"],
+                            task_number=problem["task_number"],
                         )
                         if problem["choices"]:
                             await db.insert_choices(q_id, problem["choices"])
