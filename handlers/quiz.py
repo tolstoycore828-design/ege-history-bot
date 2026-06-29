@@ -1,9 +1,10 @@
+import random
+import re
 from aiogram import Router, F
 from aiogram.types import (
     CallbackQuery, Message,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
-    InputMediaPhoto,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -46,6 +47,36 @@ def _number_reply_kb(count: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
 
 
+def _is_sequence_answer(answer: str) -> bool:
+    """Проверяет, является ли ответ последовательностью цифр (задание на соответствие)."""
+    return bool(answer and re.fullmatch(r'[1-9]{2,6}', answer.strip()))
+
+
+def _generate_sequence_variants(correct: str) -> list[str]:
+    """Генерирует 4 варианта последовательности: правильный + 3 неправильных."""
+    digits = list(correct)
+    variants = {correct}
+    attempts = 0
+    while len(variants) < 4 and attempts < 100:
+        shuffled = digits[:]
+        random.shuffle(shuffled)
+        variants.add("".join(shuffled))
+        attempts += 1
+    variants = list(variants)
+    random.shuffle(variants)
+    return variants
+
+
+def _sequence_inline_kb(q_id: int, variants: list[str], correct: str) -> InlineKeyboardMarkup:
+    rows = []
+    for v in variants:
+        rows.append([InlineKeyboardButton(
+            text=v,
+            callback_data=f"seq_answer:{q_id}:{v}:{correct}",
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _build_text(header: str, question: str, choices: list) -> str:
     lines = [header + question, ""]
     for i, c in enumerate(choices, 1):
@@ -59,7 +90,6 @@ async def _send_question(target, state: FSMContext, mode: str = "topic"):
     topic_id = data.get("topic_id")
     task_number = data.get("task_number")
 
-    # Получаем вопрос в зависимости от режима
     if mode == "task":
         questions = await db.get_questions_by_task(task_number, limit=1, exclude_ids=seen if seen else None)
         if not questions:
@@ -71,8 +101,13 @@ async def _send_question(target, state: FSMContext, mode: str = "topic"):
             seen = []
             questions = await db.get_questions(topic_id, limit=1)
 
+    # Для вопросов без вариантов проверяем, можно ли сделать соответствие
     if not questions:
-        text = "В этой теме нет тестовых вопросов с вариантами ответов."
+        # Попробуем взять вопросы с ответом-последовательностью
+        pass
+
+    if not questions:
+        text = "В этой теме нет тестовых вопросов."
         if isinstance(target, CallbackQuery):
             await target.message.edit_text(text)
         else:
@@ -99,35 +134,48 @@ async def _send_question(target, state: FSMContext, mode: str = "topic"):
 
     task_label = f" · Задание {q['task_number']}" if q["task_number"] else ""
     header = f"📌 <b>{topic['code']}. {topic['title']}</b>{task_label}\n\n"
+    send = target.message if isinstance(target, CallbackQuery) else target
+
+    # Вопрос на соответствие (ответ — последовательность цифр, нет вариантов)
+    if not choices and _is_sequence_answer(q["answer"] or ""):
+        correct = q["answer"].strip()
+        variants = _generate_sequence_variants(correct)
+        text = header + q["text"]
+        kb = _sequence_inline_kb(q["id"], variants, correct)
+
+        if q["image_url"]:
+            try:
+                await send.answer_photo(photo=q["image_url"], caption=text[:1024], parse_mode="HTML")
+                if isinstance(target, CallbackQuery):
+                    await send.answer("Выбери правильную последовательность:", reply_markup=kb)
+                else:
+                    await send.answer("Выбери правильную последовательность:", reply_markup=kb)
+            except Exception:
+                if isinstance(target, CallbackQuery):
+                    await send.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                else:
+                    await send.answer(text, parse_mode="HTML", reply_markup=kb)
+        else:
+            if isinstance(target, CallbackQuery):
+                await send.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            else:
+                await send.answer(text, parse_mode="HTML", reply_markup=kb)
+        return
+
+    # Обычный вопрос с вариантами
     text = _build_text(header, q["text"], choices)
     kb = _number_reply_kb(len(choices))
 
-    send = target.message if isinstance(target, CallbackQuery) else target
-
     if q["image_url"]:
-        # Отправляем картинку с текстом
         try:
-            if isinstance(target, CallbackQuery):
-                await send.answer_photo(
-                    photo=q["image_url"],
-                    caption=text[:1024],
-                    parse_mode="HTML",
-                )
-                await send.answer("Выбери номер ответа:", reply_markup=kb)
-            else:
-                await send.answer_photo(
-                    photo=q["image_url"],
-                    caption=text[:1024],
-                    parse_mode="HTML",
-                    reply_markup=kb,
-                )
+            await send.answer_photo(photo=q["image_url"], caption=text[:1024], parse_mode="HTML")
+            await send.answer("Выбери номер ответа:", reply_markup=kb)
         except Exception:
-            # Если картинка недоступна — показываем без неё
             if isinstance(target, CallbackQuery):
                 await send.edit_text(text, parse_mode="HTML")
-                await send.answer("Выбери номер ответа:", reply_markup=kb)
             else:
-                await send.answer(text, parse_mode="HTML", reply_markup=kb)
+                await send.answer(text, parse_mode="HTML")
+            await send.answer("Выбери номер ответа:", reply_markup=kb)
     else:
         if isinstance(target, CallbackQuery):
             await send.edit_text(text, parse_mode="HTML")
@@ -162,6 +210,36 @@ async def cb_task_next(cb: CallbackQuery, state: FSMContext):
     task_number = int(cb.data.split(":")[1])
     await state.update_data(task_number=task_number)
     await _send_question(cb, state, mode="task")
+
+
+@router.callback_query(F.data.startswith("seq_answer:"))
+async def cb_seq_answer(cb: CallbackQuery, state: FSMContext):
+    parts = cb.data.split(":")
+    q_id, chosen, correct = int(parts[1]), parts[2], parts[3]
+
+    data = await state.get_data()
+    topic_id = data.get("topic_id")
+    task_number = data.get("task_number")
+    section_id = data.get("section_id", topic_id)
+    mode = data.get("mode", "topic")
+
+    q = await db.get_question(q_id)
+    topic = await db.get_topic(q["topic_id"])
+
+    is_correct = (chosen == correct)
+    await db.save_progress(cb.from_user.id, q_id, is_correct)
+
+    task_label = f" · Задание {q['task_number']}" if q["task_number"] else ""
+    header = f"📌 <b>{topic['code']}. {topic['title']}</b>{task_label}\n\n"
+    result = "✅ <b>Верно!</b>" if is_correct else f"❌ <b>Неверно.</b> Правильный ответ: <b>{correct}</b>"
+    explanation = f"\n\n💡 <i>{q['explanation'][:500]}</i>" if q["explanation"] else ""
+    text = header + q["text"] + f"\n\n{result}{explanation}"
+
+    nav_topic_id = task_number if mode == "task" else topic_id
+    await state.clear()
+
+    await cb.message.edit_text(text, parse_mode="HTML",
+                               reply_markup=_nav_kb(nav_topic_id, section_id, mode=mode))
 
 
 @router.message(QuizState.answering)
@@ -218,12 +296,5 @@ async def msg_answer(message: Message, state: FSMContext):
     nav_topic_id = task_number if mode == "task" else topic_id
     await state.clear()
 
-    await message.answer(
-        text,
-        parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    await message.answer(
-        "Что дальше?",
-        reply_markup=_nav_kb(nav_topic_id, section_id, mode=mode),
-    )
+    await message.answer(text, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Что дальше?", reply_markup=_nav_kb(nav_topic_id, section_id, mode=mode))
