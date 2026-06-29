@@ -1,5 +1,9 @@
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    CallbackQuery, Message,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -7,14 +11,12 @@ import database as db
 
 router = Router()
 
-NUMBERS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
-
 
 class QuizState(StatesGroup):
     answering = State()
 
 
-def _quiz_nav(topic_id: int, section_id: int) -> InlineKeyboardMarkup:
+def _nav_kb(topic_id: int, section_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➡️ Следующий вопрос", callback_data=f"quiz_next:{topic_id}")],
         [InlineKeyboardButton(text="⬅️ К теме", callback_data=f"section:{section_id}")],
@@ -22,25 +24,28 @@ def _quiz_nav(topic_id: int, section_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def _build_question_text(header: str, question: str, choices: list) -> str:
-    text = header + question + "\n\n"
+def _number_reply_kb(count: int) -> ReplyKeyboardMarkup:
+    row_size = 4
+    rows = []
+    row = []
+    for i in range(1, count + 1):
+        row.append(KeyboardButton(text=str(i)))
+        if len(row) == row_size:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+def _build_text(header: str, question: str, choices: list) -> str:
+    lines = [header + question, ""]
     for i, c in enumerate(choices, 1):
-        text += f"{i}. {c['text']}\n"
-    return text.strip()
+        lines.append(f"{i}. {c['text']}")
+    return "\n".join(lines)
 
 
-def _number_kb(question_id: int, choices: list, section_id: int) -> InlineKeyboardMarkup:
-    buttons = [
-        InlineKeyboardButton(
-            text=str(i),
-            callback_data=f"answer:{question_id}:{i}:{section_id}",
-        )
-        for i in range(1, len(choices) + 1)
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=[buttons])
-
-
-async def _send_question(cb_or_msg, topic_id: int, state: FSMContext):
+async def _send_question(target, topic_id: int, state: FSMContext):
     data = await state.get_data()
     seen = data.get("seen", [])
 
@@ -48,54 +53,55 @@ async def _send_question(cb_or_msg, topic_id: int, state: FSMContext):
     if not questions:
         seen = []
         questions = await db.get_questions(topic_id, limit=1)
-        if not questions:
-            text = "В этой теме пока нет вопросов."
-            if hasattr(cb_or_msg, "message"):
-                await cb_or_msg.message.edit_text(text)
-            else:
-                await cb_or_msg.answer(text)
-            return
 
-    q = questions[0]
+    # Пропускаем вопросы без вариантов ответа
+    attempts = 0
+    while questions:
+        q = questions[0]
+        choices = await db.get_choices(q["id"])
+        if choices:
+            break
+        seen.append(q["id"])
+        attempts += 1
+        if attempts > 20:
+            q = None
+            break
+        questions = await db.get_questions(topic_id, limit=1, exclude_ids=seen)
+
+    if not questions or not q:
+        text = "В этой теме нет тестовых вопросов с вариантами ответов."
+        if isinstance(target, CallbackQuery):
+            await target.message.edit_text(text)
+        else:
+            await target.answer(text, reply_markup=ReplyKeyboardRemove())
+        return
+
+    choices = await db.get_choices(q["id"])
     seen.append(q["id"])
 
     topic = await db.get_topic(topic_id)
     section = await db.get_topic(topic["parent_id"])
     section_id = section["id"] if section else topic_id
-    choices = await db.get_choices(q["id"])
 
     await state.update_data(
         seen=seen,
         topic_id=topic_id,
-        current_q=q["id"],
         section_id=section_id,
+        current_q=q["id"],
         correct_letter=q["answer"].strip().upper() if q["answer"] else "",
         choices=[dict(c) for c in choices],
     )
+    await state.set_state(QuizState.answering)
 
     header = f"📌 <b>{topic['code']}. {topic['title']}</b>\n\n"
-    send = cb_or_msg.message if hasattr(cb_or_msg, "message") else cb_or_msg
+    text = _build_text(header, q["text"], choices)
+    kb = _number_reply_kb(len(choices))
 
-    if choices:
-        await state.set_state(QuizState.answering)
-        text = _build_question_text(header, q["text"], choices)
-        kb = _number_kb(q["id"], choices, section_id)
-        if hasattr(cb_or_msg, "message"):
-            await send.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        else:
-            await send.answer(text, parse_mode="HTML", reply_markup=kb)
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, parse_mode="HTML")
+        await target.message.answer("Выбери номер ответа:", reply_markup=kb)
     else:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text="✅ Показать ответ",
-                callback_data=f"show_answer:{q['id']}:{topic_id}:{section_id}",
-            )],
-        ])
-        text = header + q["text"]
-        if hasattr(cb_or_msg, "message"):
-            await send.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        else:
-            await send.answer(text, parse_mode="HTML", reply_markup=kb)
+        await target.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("quiz_start:"))
@@ -111,28 +117,39 @@ async def cb_quiz_next(cb: CallbackQuery, state: FSMContext):
     await _send_question(cb, topic_id, state)
 
 
-@router.callback_query(F.data.startswith("answer:"))
-async def cb_answer(cb: CallbackQuery, state: FSMContext):
-    parts = cb.data.split(":")
-    q_id, chosen_num, section_id = int(parts[1]), int(parts[2]), int(parts[3])
+@router.message(QuizState.answering)
+async def msg_answer(message: Message, state: FSMContext):
+    data = await state.get_data()
+    q_id = data.get("current_q")
+    topic_id = data.get("topic_id")
+    section_id = data.get("section_id")
+    choices = data.get("choices", [])
+
+    if not message.text or not message.text.isdigit():
+        await message.answer("Нажми на цифру на панели ниже 👇")
+        return
+
+    chosen_num = int(message.text)
+    if chosen_num < 1 or chosen_num > len(choices):
+        await message.answer(f"Введи число от 1 до {len(choices)}")
+        return
 
     q = await db.get_question(q_id)
     topic = await db.get_topic(q["topic_id"])
-    choices = await db.get_choices(q_id)
 
-    # Определяем правильный номер по букве из ответа
     correct_letter = q["answer"].strip().upper() if q["answer"] else ""
     letters = [c["letter"].upper() for c in choices]
-    correct_num = letters.index(correct_letter) + 1 if correct_letter in letters else None
 
-    # Если ответ — просто цифра (некоторые вопросы так устроены)
-    if correct_num is None and correct_letter.isdigit():
+    if correct_letter in letters:
+        correct_num = letters.index(correct_letter) + 1
+    elif correct_letter.isdigit():
         correct_num = int(correct_letter)
+    else:
+        correct_num = None
 
     is_correct = (chosen_num == correct_num)
-    await db.save_progress(cb.from_user.id, q_id, is_correct)
+    await db.save_progress(message.from_user.id, q_id, is_correct)
 
-    # Формируем текст с вариантами, где правильный выделен
     header = f"📌 <b>{topic['code']}. {topic['title']}</b>\n\n"
     choices_text = ""
     for i, c in enumerate(choices, 1):
@@ -143,40 +160,18 @@ async def cb_answer(cb: CallbackQuery, state: FSMContext):
         else:
             choices_text += f"{i}. {c['text']}\n"
 
-    if is_correct:
-        result = "✅ <b>Верно!</b>"
-    else:
-        result = f"❌ <b>Неверно.</b> Правильный ответ: <b>{correct_num}</b>"
-
+    result = "✅ <b>Верно!</b>" if is_correct else f"❌ <b>Неверно.</b> Правильный ответ: <b>{correct_num}</b>"
     explanation = f"\n\n💡 <i>{q['explanation'][:500]}</i>" if q["explanation"] else ""
 
     text = header + q["text"] + "\n\n" + choices_text.strip() + f"\n\n{result}{explanation}"
 
-    await cb.message.edit_text(
+    await state.clear()
+    await message.answer(
         text,
         parse_mode="HTML",
-        reply_markup=_quiz_nav(q["topic_id"], section_id),
+        reply_markup=ReplyKeyboardRemove(),
     )
-    await state.clear()
-
-
-@router.callback_query(F.data.startswith("show_answer:"))
-async def cb_show_answer(cb: CallbackQuery, state: FSMContext):
-    parts = cb.data.split(":")
-    q_id, topic_id, section_id = int(parts[1]), int(parts[2]), int(parts[3])
-
-    q = await db.get_question(q_id)
-    topic = await db.get_topic(topic_id)
-
-    answer_text = q["answer"] or "—"
-    explanation = f"\n\n💡 <i>{q['explanation'][:500]}</i>" if q["explanation"] else ""
-    header = f"📌 <b>{topic['code']}. {topic['title']}</b>\n\n"
-    text = header + q["text"] + f"\n\n✅ <b>Ответ:</b> {answer_text}{explanation}"
-
-    await db.save_progress(cb.from_user.id, q_id, is_correct=True)
-    await cb.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=_quiz_nav(topic_id, section_id),
+    await message.answer(
+        "Что дальше?",
+        reply_markup=_nav_kb(topic_id, section_id),
     )
-    await state.clear()
