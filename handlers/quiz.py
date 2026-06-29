@@ -270,10 +270,12 @@ async def msg_answer(message: Message, state: FSMContext):
 
     if correct_letter in letters:
         correct_num = letters.index(correct_letter) + 1
-    elif correct_letter.isdigit():
+    elif correct_letter.isdigit() and 1 <= int(correct_letter) <= len(choices):
         correct_num = int(correct_letter)
     else:
-        correct_num = None
+        # Попробуем найти по первому совпадению цифры в ответе
+        digits = re.findall(r'\d+', correct_letter)
+        correct_num = int(digits[0]) if digits and 1 <= int(digits[0]) <= len(choices) else None
 
     is_correct = (chosen_num == correct_num)
     await db.save_progress(message.from_user.id, q_id, is_correct)

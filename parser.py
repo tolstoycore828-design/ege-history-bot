@@ -165,17 +165,27 @@ async def parse_problem_page(session: aiohttp.ClientSession, problem_id: str) ->
     exp_div = problem_div.find("div", class_="solution")
     explanation = clean_text(exp_div) if exp_div else ""
 
-    # Multiple choice options
+    # Multiple choice options — ищем параграфы вида "1) текст"
     choices = []
-    for li in problem_div.find_all("li", class_=lambda c: c and "choice" in c):
-        letter_tag = li.find("span", class_="choice_letter")
-        if not letter_tag:
-            continue
-        letter = letter_tag.get_text(strip=True).rstrip(".")
-        text_tag = li.find("span", class_="choice_text")
-        choice_text = clean_text(text_tag) if text_tag else ""
-        if choice_text:
-            choices.append((letter, choice_text))
+    pbody = problem_div.find("div", class_="pbody")
+    if pbody:
+        for p in pbody.find_all("p", class_="left_margin"):
+            pt = clean_text(p)
+            m = re.match(r'^(\d+)[.)]\s*(.+)$', pt)
+            if m:
+                choices.append((m.group(1), m.group(2)))
+
+    # Fallback: старый формат <li class="choice...">
+    if not choices:
+        for li in problem_div.find_all("li", class_=lambda c: c and "choice" in c):
+            letter_tag = li.find("span", class_="choice_letter")
+            if not letter_tag:
+                continue
+            letter = letter_tag.get_text(strip=True).rstrip(".")
+            text_tag = li.find("span", class_="choice_text")
+            choice_text = clean_text(text_tag) if text_tag else ""
+            if choice_text:
+                choices.append((letter, choice_text))
 
     # Task number (номер задания ЕГЭ)
     task_number = None
