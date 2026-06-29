@@ -187,20 +187,14 @@ async def parse_problem_page(session: aiohttp.ClientSession, problem_id: str) ->
             if choice_text:
                 choices.append((letter, choice_text))
 
-    # Task number (номер задания ЕГЭ)
+    # Task number (номер задания ЕГЭ) — формат "Тип Д1", "Тип Д2" и т.д.
     task_number = None
     topic_tag = soup.find("span", class_="prob_nums")
     if topic_tag:
-        m = re.search(r"Задание\s*(\d+)", topic_tag.get_text())
+        tag_text = topic_tag.get_text()
+        m = re.search(r"(?:Тип\s*[ДдD]?|Задание\s*)(\d+)", tag_text)
         if m:
             task_number = int(m.group(1))
-    if task_number is None:
-        # try from breadcrumb or header
-        for tag in soup.find_all(text=re.compile(r"Задание\s*\d+")):
-            m = re.search(r"Задание\s*(\d+)", tag)
-            if m:
-                task_number = int(m.group(1))
-                break
 
     q_type = "choice" if choices else "open"
 
