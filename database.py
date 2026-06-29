@@ -77,11 +77,17 @@ async def get_questions(topic_id, limit=1, offset=0, exclude_ids=None):
     async with pool.acquire() as conn:
         if exclude_ids:
             return await conn.fetch(
-                "SELECT * FROM questions WHERE topic_id=$1 AND id != ALL($2) ORDER BY RANDOM() LIMIT $3 OFFSET $4",
+                """SELECT q.* FROM questions q
+                   WHERE q.topic_id=$1 AND q.id != ALL($2)
+                   AND EXISTS (SELECT 1 FROM choices WHERE question_id=q.id)
+                   ORDER BY RANDOM() LIMIT $3 OFFSET $4""",
                 topic_id, exclude_ids, limit, offset,
             )
         return await conn.fetch(
-            "SELECT * FROM questions WHERE topic_id=$1 ORDER BY RANDOM() LIMIT $2 OFFSET $3",
+            """SELECT q.* FROM questions q
+               WHERE q.topic_id=$1
+               AND EXISTS (SELECT 1 FROM choices WHERE question_id=q.id)
+               ORDER BY RANDOM() LIMIT $2 OFFSET $3""",
             topic_id, limit, offset,
         )
 
@@ -104,7 +110,9 @@ async def count_questions(topic_id):
     pool = await get_pool()
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            "SELECT COUNT(*) FROM questions WHERE topic_id=$1", topic_id
+            """SELECT COUNT(*) FROM questions q WHERE q.topic_id=$1
+               AND EXISTS (SELECT 1 FROM choices WHERE question_id=q.id)""",
+            topic_id,
         )
 
 
